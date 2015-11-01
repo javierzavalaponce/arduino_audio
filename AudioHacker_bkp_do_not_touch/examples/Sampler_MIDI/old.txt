@@ -1,0 +1,438 @@
+/*
+  Audio Hacker Library
+  Copyright (C) 2013 nootropic design, LLC
+  All rights reserved.
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+  
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include <MIDI.h>
+
+#define MAX_UINT 65535
+#define SRAM1_SS 10
+#define SRAM2_SS 9
+#define DAC_SS 8
+#define ADC_SS 7
+#define MIDI_ENABLE 17
+
+#if defined(__AVR_ATmega328P__)
+#define SELECT_SRAM1 PORTB &= ~0x04
+#define DESELECT_SRAM1 PORTB |= 0x04
+#define SELECT_SRAM2 PORTB &= ~0x02
+#define DESELECT_SRAM2 PORTB |= 0x02
+#define SELECT_DAC PORTB &= ~0x01
+#define DESELECT_DAC PORTB |= 0x01
+#define SELECT_ADC PORTD &= ~0x80
+#define DESELECT_ADC PORTD |= 0x80
+#endif
+
+#if defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
+#define SELECT_SRAM1 PORTB &= ~0x10
+#define DESELECT_SRAM1 PORTB |= 0x10
+#define SELECT_SRAM2 PORTH &= ~0x40
+#define DESELECT_SRAM2 PORTH |= 0x40
+#define SELECT_DAC PORTH &= ~0x20
+#define DESELECT_DAC PORTH |= 0x20
+#define SELECT_ADC PORTH &= ~0x10
+#define DESELECT_ADC PORTH |= 0x10
+#endif
+
+#define DAC_CONFIG 0x30 // DACa, unbuffered, gain=1, not shutdown
+
+#define MAX_ADDR 131067 // last address for 3-byte storage of 2 samples
+// range is 0-131071.  We skip last two bytes of chip.
+#define DEFAULT_SAMPLE_RATE 22050
+#define OFF 0
+#define PASSTHROUGH 1
+#define RECORD 2
+#define PLAYBACK 3
+#define RECORD_DONE 4
+#define RECORD_BUTTON 5
+#define PLAY_BUTTON 6
+#define BASE_NOTE 60
+
+unsigned int playbackBuf = 2048;
+volatile unsigned int tEven;
+volatile unsigned int tOdd;
+volatile int maxSignal = 0;
+unsigned int sampleRate;
+unsigned int playbackRate;
+unsigned int startCounter;
+int currentPosition;
+volatile long address = 0;
+volatile long endAddress = 0;
+volatile byte addressChipNumber = 0;
+volatile byte endAddressChipNumber = 0;
+
+volatile byte mode = PASSTHROUGH;
+int loopCounter = 0;
+int writeBuf;
+int readBuf;
+boolean evenCycle = true;
+unsigned int recordStartTime;
+unsigned int recordEndTime;
+byte lastNote = 0xFF;
+float midi_freq[120];
+
+void setup() {
+#ifdef DEBUG
+  Serial.begin(115200);        // connect to the serial port
+#endif
+
+  pinMode(SCK, OUTPUT);
+  pinMode(MISO, INPUT);
+  pinMode(MOSI, OUTPUT);
+  pinMode(SS, OUTPUT);
+
+  digitalWrite(SCK, LOW);
+  digitalWrite(MISO, LOW);
+  digitalWrite(MOSI, LOW);
+  digitalWrite(SS, HIGH);
+
+  pinMode(SRAM1_SS, OUTPUT);
+  pinMode(SRAM2_SS, OUTPUT);
+  pinMode(DAC_SS, OUTPUT);
+  pinMode(ADC_SS, OUTPUT);
+
+  pinMode(RECORD_BUTTON, INPUT);
+  pinMode(PLAY_BUTTON, INPUT);
+  digitalWrite(RECORD_BUTTON, HIGH);
+  digitalWrite(PLAY_BUTTON, HIGH);
+
+  digitalWrite(SRAM1_SS, HIGH);
+  digitalWrite(SRAM2_SS, HIGH);
+  digitalWrite(DAC_SS, HIGH);
+  digitalWrite(ADC_SS, HIGH);
+
+  // Configure SPI
+  SPCR |= _BV(SPE);    // enable SPI
+  SPCR &= ~_BV(SPIE);  // SPI interrupts off
+  SPCR &= ~_BV(DORD);  // MSB first
+  SPCR |= _BV(MSTR);   // SPI master mode
+  SPCR &= ~_BV(CPOL);  // leading edge rising
+  SPCR &= ~_BV(CPHA);  // sample on leading edge
+  SPCR &= ~_BV(SPR1);  // speed = clock/4
+  SPCR &= ~_BV(SPR0);  
+  SPSR |= _BV(SPI2X);  // 2X speed
+
+  pinMode(MIDI_ENABLE, OUTPUT);
+  digitalWrite(MIDI_ENABLE, HIGH);
+  MIDI.begin(MIDI_CHANNEL_OMNI);    
+  MIDI.setHandleNoteOn(handleNoteOn);
+  MIDI.setHandleNoteOff(handleNoteOff);
+  for(int i=0;i<120;i++) {
+    midi_freq[i] = 440.0 * (pow(2, (i-69)/12.0));
+  }
+
+
+  // Disable Timer1 interrupt
+  TIMSK1 &= ~_BV(TOIE1);
+
+  TCCR1A = 0;
+  TCCR1B = 0;
+
+  // Set prescalar to 1;
+  TCCR1B |= _BV(CS10);
+
+  sampleRate = DEFAULT_SAMPLE_RATE;
+  startCounter = MAX_UINT - (16000000 / sampleRate);
+
+  // Enable Timer1 interrupt
+  TIMSK1 |= _BV(TOIE1);
+
+
+#ifdef DEBUG
+  Serial.println("setup complete.");
+#endif
+}
+
+void loop() {
+  MIDI.read();
+
+  //sampleRate = map(analogRead(0), 0, 1023, 10000, 30000);
+  // compute the start value for counter1 to achieve the chosen sample rate
+  startCounter = MAX_UINT - (16000000 / sampleRate);
+
+  if (loopCounter++ == 5000) {
+    loopCounter = 0;
+
+#ifdef DEBUG
+    Serial.print("sampleRate = ");
+    Serial.print(sampleRate);
+    Serial.print(" Hz");
+
+    Serial.print("   even cycles remaining = ");
+    Serial.print(MAX_UINT - tEven);
+    Serial.print("   odd cycles remaining = ");
+    Serial.print(MAX_UINT - tOdd);
+
+    Serial.println();
+#endif
+
+  }
+
+  if ((mode == OFF) || (mode == PASSTHROUGH)) {
+    if (digitalRead(RECORD_BUTTON) == LOW) {
+      recordStartTime = millis();
+      if ((recordStartTime - recordEndTime) < 20) {
+	// debounce the record button.
+	recordStartTime = 0;
+	return;
+      }
+      mode = RECORD;
+      currentPosition = analogRead(0);
+      address = 0;
+      addressChipNumber = 0;
+    }
+    if (digitalRead(PLAY_BUTTON) == LOW) {
+      mode = PLAYBACK;
+      playbackRate = map(currentPosition-analogRead(0), -1023, 1023, sampleRate+20000, sampleRate-20000);
+      //playbackRate = DEFAULT_SAMPLE_RATE;
+      //playbackRate = sampleRate;
+      // compute the start value for counter1 to achieve the chosen playback rate
+      startCounter = MAX_UINT - (16000000 / playbackRate);
+      address = 0;
+      addressChipNumber = 0;
+    }
+  }
+
+  if (mode == RECORD) {
+    if (digitalRead(RECORD_BUTTON) == HIGH) {
+      // record button released
+      recordEndTime = millis();
+#ifdef DEBUG
+      Serial.print("recording time = ");
+      Serial.println(recordEndTime - recordStartTime);
+#endif
+      endAddress = address;
+      endAddressChipNumber = addressChipNumber;
+      mode = PASSTHROUGH;
+      address = 0;
+      addressChipNumber = 0;
+    }
+  }
+
+  if (mode == RECORD_DONE) {
+    if (recordStartTime != 0) {
+#ifdef DEBUG
+      Serial.print("recording time = ");
+      Serial.println(millis() - recordStartTime);
+#endif
+      recordStartTime = 0;
+    }
+    if (digitalRead(RECORD_BUTTON) == HIGH) {
+      // record button released
+      mode = PASSTHROUGH;
+    }
+  }
+
+  if (mode == PLAYBACK) {
+    if ((digitalRead(PLAY_BUTTON) == HIGH) && (lastNote == 0xFF)) {
+      // play button released or MIDI off.
+      mode = PASSTHROUGH;
+      address = 0;
+      addressChipNumber = 0;
+    } else {
+      //playbackRate = map(currentPosition-analogRead(0), -1023, 1023, sampleRate+20000, sampleRate-20000);
+      //playbackRate = DEFAULT_SAMPLE_RATE;
+      //playbackRate = sampleRate;
+      // compute the start value for counter1 to achieve the chosen playback rate
+      startCounter = MAX_UINT - (16000000 / playbackRate);
+    }
+  }
+}
+
+void handleNoteOn(byte channel, byte note, byte velocity) { 
+  if (velocity == 0) {
+    // This acts like a NoteOff.
+    if (note == lastNote) {
+      mode = PASSTHROUGH;
+      lastNote = 0xFF;
+    }
+  } else {
+    //    float ratio = 1.0 + ((midi_freq[note] - midi_freq[BASE_NOTE]) / midi_freq[BASE_NOTE]);
+    //playbackRate = (unsigned int)(sampleRate * ratio);
+    mode = PLAYBACK;
+    long length = endAddress + (MAX_ADDR * endAddressChipNumber);
+    byte n = 13;
+    address = (note-60) * (length/n); // divide sample into n slices
+    if (address > MAX_ADDR) {
+      addressChipNumber = 1;
+      address -= MAX_ADDR;
+    } else {
+      addressChipNumber = 0;
+    }
+
+    // round down to multiple of 3.  Two 1.5 byte samples are stored in each group of 3 bytes.
+    address -= (address % 3);
+    lastNote = note;
+  }
+}
+
+void handleNoteOff(byte channel, byte note, byte velocity) { 
+  mode = PASSTHROUGH;
+  lastNote = 0xFF;
+}
+
+
+inline byte spiWrite(byte data) {
+  SPDR = data;
+  while (!(SPSR & _BV(SPIF)));
+  return SPDR;
+}
+
+inline byte spiRead() {
+  SPDR = 0xFF; // start SPI clock
+  while (!(SPSR & _BV(SPIF)));
+  return SPDR;
+}
+
+ISR(TIMER1_OVF_vect) {
+  TCNT1 = startCounter;
+  int signal;
+  int sample;
+  byte highByte;
+  byte lowByte;
+  byte save;
+
+
+  if (mode != RECORD_DONE) {
+    //  if ((mode != RECORD_DONE) && (mode != RECORD)) {
+    // Write to DAC
+    SELECT_DAC;
+    spiWrite(DAC_CONFIG | ((playbackBuf >> 8) & 0xF)); // 4 config bits and bits 11-8
+    spiWrite(playbackBuf); // bits 7-0
+    DESELECT_DAC;
+  }
+
+
+  if ((mode != PLAYBACK) && (mode != RECORD_DONE)) {
+    // Read ADC
+    SPCR |= _BV(SPR0);  // set SPI clock to clock/16 with SPI2X = 2MHz
+    SELECT_ADC;
+    highByte = spiRead();
+    save = (highByte & 0x01) << 7;
+    lowByte = spiRead();
+    lowByte = (lowByte >> 1) | save;
+    DESELECT_ADC;
+    signal = highByte & 0x1E;
+    signal = (signal << 7) | lowByte;
+    SPCR &= ~_BV(SPR0);  // restore clock to clock/4 with SPI2X = 8MHz
+  }
+
+  if (mode == RECORD) {
+    if (evenCycle) {
+      // we only write to memory on odd cycles, so buffer the sampled signal.
+      writeBuf = signal;
+    } else {
+      // Write to SRAM
+      if (addressChipNumber == 0) {
+	SELECT_SRAM1;
+      } else {
+	SELECT_SRAM2;
+      }
+      spiWrite(0x02);           // write mode
+      spiWrite(address >> 16);  // address
+      spiWrite(address >> 8);
+      spiWrite(address);
+      writeBuf = writeBuf<<4;
+      spiWrite(writeBuf >> 8);    // buffer MSB
+      spiWrite(writeBuf | (signal >> 8)); // buffer least sig and signal most sig 4 bits
+      spiWrite(signal);         // signal LSB
+      if (addressChipNumber == 0) {
+	DESELECT_SRAM1;
+      } else {
+	DESELECT_SRAM2;
+      }
+
+      address += 3;
+      if (address > MAX_ADDR) {
+	if (addressChipNumber == 0) {
+	  // proceed to the second SRAM chip
+	  address = 0;
+	  addressChipNumber = 1;
+	} else {
+	  // end of memory, stop recording
+	  mode = RECORD_DONE;
+	  endAddress = address;
+	  endAddressChipNumber = 1;
+	  address = 0; // loop around to beginning of memory
+	  addressChipNumber = 0;
+	}
+      }
+    }
+  }
+
+
+  if (mode == PLAYBACK) {
+    if (evenCycle) {
+      // Read from SRAM
+      if (addressChipNumber == 0) {
+	SELECT_SRAM1;
+      } else {
+	SELECT_SRAM2;
+      }
+      spiWrite(0x03);           // read mode
+      spiWrite(address >> 16);  // address
+      spiWrite(address >> 8);
+      spiWrite(address);
+      highByte = spiRead();
+      lowByte = spiRead();
+      sample = highByte;
+      sample = (sample << 4) | (lowByte >> 4);
+      highByte = lowByte;
+      lowByte = spiRead();
+      readBuf = highByte & 0x0F;
+      readBuf = (readBuf << 8) | lowByte;
+      if (addressChipNumber == 0) {
+	DESELECT_SRAM1;
+      } else {
+	DESELECT_SRAM2;
+      }
+
+      address += 3;
+      if (address > MAX_ADDR) {
+	if (addressChipNumber == 0) {
+	  address = 0;
+	  addressChipNumber = 1;
+	} else {
+	  address = 0;
+	  addressChipNumber = 0;
+	}
+      }
+      if ((address == endAddress) && (addressChipNumber == endAddressChipNumber)) {
+	address = 0;
+	addressChipNumber = 0;
+      }
+    } else {
+      sample = readBuf;
+    }
+
+    signal = sample;
+
+  } // PLAYBACK
+
+
+
+  playbackBuf = signal;
+
+  if (evenCycle) {
+    tEven = TCNT1;
+  } else {
+    tOdd = TCNT1;
+  }
+  evenCycle = !evenCycle;
+}
+
+
