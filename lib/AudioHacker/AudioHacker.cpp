@@ -20,12 +20,25 @@
 
 #include "AudioHacker.h"
 
+#ifndef WORKAROUND_TO_CONNECT_AUDIO_HACKER_TO_ARDUINO_MEGA2560
+#define PIN_IN_MEGA2560_11 11
+#define PIN_IN_MEGA2560_12 12
+#define PIN_IN_MEGA2560_13 13
+#endif
+
 AudioHackerClass::AudioHackerClass() {
 }
 
 
 
 void AudioHackerClass::begin() {
+	
+#ifndef WORKAROUND_TO_CONNECT_AUDIO_HACKER_TO_ARDUINO_MEGA2560
+pinMode(PIN_IN_MEGA2560_11, INPUT);
+pinMode(PIN_IN_MEGA2560_11, INPUT);
+pinMode(PIN_IN_MEGA2560_11, INPUT);
+#endif
+	
   pinMode(SCK, OUTPUT);
   pinMode(MISO, INPUT);
   pinMode(MOSI, OUTPUT);
