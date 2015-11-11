@@ -29,7 +29,7 @@
 #endif
 
 
-#define UINT16_MAX 65535
+//#define UINT16_MAX 65535
 
 #define SRAM0_SS 10
 #define SRAM1_SS 9
