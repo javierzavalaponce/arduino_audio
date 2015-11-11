@@ -10,34 +10,26 @@
 
 
 #include <AudioHacker.h>
-#include "file_audio.h"
+#include "file_voice_recorded.h"
 
 unsigned int passthroughSampleRate;
 static volatile unsigned int timer1Start;
 static volatile unsigned int index=0;
-static volatile unsigned int cnt=0;
-int incomingByte = 0;   // for incoming serial data
+
 void setup() {
-  //Serial.begin(115200);
-  passthroughSampleRate = DEFAULT_SAMPLE_RATE;
-  timer1Start = UINT16_MAX - (F_CPU / passthroughSampleRate);
-  AudioHacker.begin();
-  //Serial.print("hola");
-  cnt = 0;
-  
+    passthroughSampleRate = 16000;
+    timer1Start = UINT16_MAX - (F_CPU / passthroughSampleRate);
+    AudioHacker.begin();
 }
 
 void loop() {}
 
 ISR(TIMER1_OVF_vect) {
-  TCNT1 = timer1Start;
-  if (cnt < 42000){
-    cnt++;
-    AudioHacker.writeDAC(signal[index++]);
-    if (index == MAX_SIZE_ARRAY){
-      index = 0;
+    TCNT1 = timer1Start;
+    AudioHacker.writeDAC(voice[index++]>>4);
+    if (index == MAX_SIZE_ARRAY) {
+        index = 0;
     }
-  }
 }
 
 
