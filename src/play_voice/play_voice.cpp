@@ -12,12 +12,13 @@
 #include <AudioHacker.h>
 #include "file_voice_recorded.h"
 
+
 unsigned int passthroughSampleRate;
 static volatile unsigned int timer1Start;
 static volatile unsigned int index=0;
 
 void setup() {
-    passthroughSampleRate = 16000;
+    passthroughSampleRate = 42000;
     timer1Start = UINT16_MAX - (F_CPU / passthroughSampleRate);
     AudioHacker.begin();
 }
@@ -26,7 +27,7 @@ void loop() {}
 
 ISR(TIMER1_OVF_vect) {
     TCNT1 = timer1Start;
-    AudioHacker.writeDAC(voice[index++]>>4);
+    AudioHacker.writeDAC(voice[index++]);
     if (index == MAX_SIZE_ARRAY) {
         index = 0;
     }
